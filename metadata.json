@@ -1,0 +1,6 @@
+{
+  "name": "키즈 아티스트 전용 매니저",
+  "description": "유치원·어린이집 공연 일정, 현장 큐시트, 음악·영상·사진 자료 보관함 및 AI 일정표 자동등록 앱",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
