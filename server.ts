@@ -1,6 +1,5 @@
 import express from 'express';
 import type { Request, Response } from 'express';
-import { createServer as createViteServer } from 'vite';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import dotenv from 'dotenv';
@@ -20,27 +19,31 @@ const ai = new GoogleGenAI({
   },
 });
 
-async function startServer() {
-  const app = express();
-  const PORT = Number(process.env.PORT) || 3000;
+const app = express();
+app.use(express.json({ limit: '25mb' }));
 
-  app.use(express.json({ limit: '25mb' }));
+function isModelNotFoundError(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message.toLowerCase() : String(err).toLowerCase();
+  return msg.includes('404') || msg.includes('not found') || msg.includes('not supported');
+}
 
-  app.post('/api/parse-schedule', async (req: Request, res: Response) => {
-    try {
-      const { parts } = req.body ?? {};
-      if (!Array.isArray(parts) || parts.length === 0) {
-        res.status(400).json({ error: '분석할 일정 데이터(parts)가 필요합니다.' });
-        return;
-      }
+app.post('/api/parse-schedule', async (req: Request, res: Response) => {
+  try {
+    const { parts } = req.body ?? {};
+    if (!Array.isArray(parts) || parts.length === 0) {
+      res.status(400).json({ error: '분석할 일정 데이터(parts)가 필요합니다.' });
+      return;
+    }
 
-      if (!process.env.GEMINI_API_KEY) {
-        res.status(500).json({ error: 'GEMINI_API_KEY 환경 변수가 설정되지 않았습니다.' });
-        return;
-      }
+    if (!process.env.GEMINI_API_KEY) {
+      res.status(500).json({ error: 'GEMINI_API_KEY 환경 변수가 설정되지 않았습니다.' });
+      return;
+    }
 
-      const response = await ai.models.generateContent({
-        model: 'gemini-4-hydrogen',
+    const primaryModel = process.env.GEMINI_MODEL || 'gemini-4-hydrogen';
+    const runGenerate = (model: string) =>
+      ai.models.generateContent({
+        model,
         contents: { parts },
         config: {
           responseMimeType: 'application/json',
@@ -62,20 +65,38 @@ async function startServer() {
         },
       });
 
-      res.json({ text: response.text ?? '[]' });
-    } catch (error) {
-      const message = error instanceof Error ? error.message : '일정 분석 요청 처리 중 오류가 발생했습니다.';
-      res.status(500).json({ error: message });
+    let response;
+    try {
+      response = await runGenerate(primaryModel);
+    } catch (primaryErr) {
+      if (primaryModel !== 'gemini-2.5-flash' && isModelNotFoundError(primaryErr)) {
+        response = await runGenerate('gemini-2.5-flash');
+      } else {
+        throw primaryErr;
+      }
     }
-  });
 
-  if (process.env.NODE_ENV !== 'production') {
+    res.json({ text: response.text ?? '[]' });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : '일정 분석 요청 처리 중 오류가 발생했습니다.';
+    res.status(500).json({ error: message });
+  }
+});
+
+let initialized = false;
+
+async function setupFrontendAndListen() {
+  if (initialized) return;
+  initialized = true;
+
+  if (process.env.NODE_ENV !== 'production' && !process.env.VERCEL) {
+    const { createServer: createViteServer } = await import('vite');
     const vite = await createViteServer({
       server: { middlewareMode: true },
       appType: 'spa',
     });
     app.use(vite.middlewares);
-  } else {
+  } else if (!process.env.VERCEL) {
     const distPath = path.resolve(__dirname, 'dist');
     app.use(express.static(distPath));
     app.get('*', (_req: Request, res: Response) => {
@@ -83,9 +104,14 @@ async function startServer() {
     });
   }
 
-  app.listen(PORT, '0.0.0.0', () => {
-    console.log(`Server running on http://0.0.0.0:${PORT}`);
-  });
+  if (!process.env.VERCEL) {
+    const PORT = Number(process.env.PORT) || 3000;
+    app.listen(PORT, '0.0.0.0', () => {
+      console.log(`Server running on http://0.0.0.0:${PORT}`);
+    });
+  }
 }
 
-startServer();
+setupFrontendAndListen();
+
+export default app;

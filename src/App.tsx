@@ -2083,13 +2083,74 @@ function AddShowModal({ initialDate, defaultReminders, mediaList, onAddMedia, on
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ parts })
         });
-        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        if (!response.ok) {
+          let serverMsg = `HTTP ${response.status}`;
+          try {
+            const errJson = await response.json();
+            if (errJson?.error) serverMsg = String(errJson.error);
+          } catch {
+            // ignore non-JSON error body
+          }
+          const err: any = new Error(serverMsg);
+          err.status = response.status;
+          throw err;
+        }
         return await response.json();
-      } catch (err) {
-        if (attempt === delays.length) throw err;
+      } catch (err: any) {
+        const noRetryStatuses = [400, 401, 403, 404, 413];
+        if (
+          attempt === delays.length ||
+          noRetryStatuses.includes(err?.status) ||
+          String(err?.message || '').includes('GEMINI_API_KEY')
+        ) {
+          throw err;
+        }
         await new Promise(res => setTimeout(res, delays[attempt]));
       }
     }
+  };
+
+  // 큰 이미지는 Vercel/서버리스 요청 크기 제한(4.5MB)에 맞게 자동 리사이즈
+  const readImageAsOptimizedData = async (file: File): Promise<{ mimeType: string; data: string }> => {
+    const rawDataUrl = await new Promise<string>((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(String(reader.result || ''));
+      reader.onerror = reject;
+      reader.readAsDataURL(file);
+    });
+
+    if (file.size <= 1.5 * 1024 * 1024) {
+      return {
+        mimeType: file.type || 'image/png',
+        data: rawDataUrl.split(',')[1] || ''
+      };
+    }
+
+    return new Promise((resolve) => {
+      const img = new Image();
+      img.onload = () => {
+        const maxDim = 1600;
+        const scale = Math.min(1, maxDim / Math.max(img.width, img.height));
+        const canvas = document.createElement('canvas');
+        canvas.width = Math.max(1, Math.round(img.width * scale));
+        canvas.height = Math.max(1, Math.round(img.height * scale));
+        const ctx = canvas.getContext('2d');
+        if (!ctx) {
+          resolve({ mimeType: file.type || 'image/png', data: rawDataUrl.split(',')[1] || '' });
+          return;
+        }
+        ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+        const compressedUrl = canvas.toDataURL('image/jpeg', 0.85);
+        resolve({
+          mimeType: 'image/jpeg',
+          data: compressedUrl.split(',')[1] || ''
+        });
+      };
+      img.onerror = () => {
+        resolve({ mimeType: file.type || 'image/png', data: rawDataUrl.split(',')[1] || '' });
+      };
+      img.src = rawDataUrl;
+    });
   };
 
   // 첨부된 일정표 이미지 또는 엑셀(CSV/텍스트) 자동 분석 핸들러
@@ -2111,8 +2172,11 @@ function AddShowModal({ initialDate, defaultReminders, mediaList, onAddMedia, on
 
       const parts: any[] = [{ text: promptText }];
 
-      if (file.type.startsWith('image/') || file.type === 'application/pdf' || file.name.toLowerCase().endsWith('.pdf')) {
-        // 이미지 및 PDF 파일 Base64 변환
+      if (file.type.startsWith('image/')) {
+        const optimized = await readImageAsOptimizedData(file);
+        parts.push({ inlineData: optimized });
+      } else if (file.type === 'application/pdf' || file.name.toLowerCase().endsWith('.pdf')) {
+        // PDF 파일 Base64 변환
         const base64Data = await new Promise<string>((resolve, reject) => {
           const reader = new FileReader();
           reader.onload = () => resolve(String(reader.result || '').split(',')[1]);
@@ -2121,7 +2185,7 @@ function AddShowModal({ initialDate, defaultReminders, mediaList, onAddMedia, on
         });
         parts.push({
           inlineData: {
-            mimeType: file.type || (file.name.toLowerCase().endsWith('.pdf') ? 'application/pdf' : 'image/png'),
+            mimeType: 'application/pdf',
             data: base64Data
           }
         });
@@ -2223,6 +2287,10 @@ function AddShowModal({ initialDate, defaultReminders, mediaList, onAddMedia, on
     } catch (err: any) {
       if (err?.message === 'HWP_BINARY_FORMAT') {
         setParseError('구버전 한글(.hwp) 파일은 브라우저 보안상 직접 읽기가 어렵습니다. 한글 프로그램에서 [다른 이름으로 저장 → .hwpx 또는 .pdf]로 저장하시거나, 화면을 캡처한 이미지를 올려주세요!');
+      } else if (err?.status === 413) {
+        setParseError('첨부 파일 용량이 너무 커서 서버로 전송할 수 없습니다. 파일 크기를 3MB 이하로 줄여 다시 시도해 주세요.');
+      } else if (String(err?.message || '').includes('GEMINI_API_KEY')) {
+        setParseError('서버에 GEMINI_API_KEY 환경 변수가 설정되지 않았습니다. 배포 환경 설정에 API 키를 추가해 주세요.');
       } else {
         setParseError('일정표를 분석하는 중 문제가 발생했습니다. 파일 형식을 확인하거나 다시 시도해 주세요.');
       }
